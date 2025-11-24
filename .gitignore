@@ -1,0 +1,14 @@
+# vscode
+**/.vscode
+
+# build
+**/build
+
+# sdkconfig
+**/sdkconfig
+**/sdkconfig.old
+**/dependencies.lock
+
+# managed_components
+**/managed_components
+
