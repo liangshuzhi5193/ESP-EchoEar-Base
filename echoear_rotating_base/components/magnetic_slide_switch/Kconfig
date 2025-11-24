@@ -2,7 +2,7 @@ menu "Magnetic Slide Switch Sensor Selection"
 
 choice
     prompt "Select sensor type"
-    default SENSOR_LINEAR_HALL
+    default SENSOR_MAGNETOMETER
     help
         Choose the type of sensor for magnetic slide switch detection.
 

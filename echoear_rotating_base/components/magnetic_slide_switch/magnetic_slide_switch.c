@@ -6,6 +6,8 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 #include "bmm150.h"
 #include "bmm150_defs.h"
@@ -13,8 +15,16 @@
 #include "esp_rom_sys.h"
 
 #include "magnetic_slide_switch.h"
+#include "control_serial.h"
 
 static const char *TAG = "Magnetic Slide Switch";
+
+// NVS 配置
+#define NVS_NAMESPACE       "mag_calib"
+#define NVS_KEY_REMOVED     "removed"
+#define NVS_KEY_UP          "up"
+#define NVS_KEY_DOWN        "down"
+#define NVS_KEY_CALIBRATED  "calibrated"
 
 static magnetic_slide_switch_event_t s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_INIT;
 
@@ -125,17 +135,19 @@ static void hall_sensor_read_task(void *arg)
                     s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_SLIDE_DOWN;
                     ESP_LOGI(TAG, "Hall switch: SLIDE_DOWN - Voltage dropped by %d mV (from %d to %d)", 
                              -voltage_change, s_last_hall_voltage, voltage[0][0]);
+                    control_serial_send_magnetic_switch_event(s_slider_state);
                 }
                 // 电压变大且变化量大于阈值，判定为滑块向上
                 else if (voltage_change > HALL_SENSOR_VOLTAGE_THRESHOLD && s_slider_state == MAGNETIC_SLIDE_SWITCH_EVENT_SLIDE_DOWN) {
                     s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_SLIDE_UP;
                     ESP_LOGI(TAG, "Hall switch: SLIDE_UP - Voltage increased by %d mV (from %d to %d)", 
                              voltage_change, s_last_hall_voltage, voltage[0][0]);
+                    control_serial_send_magnetic_switch_event(s_slider_state);
                 }
             } else {
                 s_first_hall_reading = false;
                 
-                // 根据第一次读取的电压值判断初始状态
+                // 根据第一次读取的电压值判断初始状态（初始状态不发送事件）
                 if (voltage[0][0] < HALL_SENSOR_INITIAL_STATE_THRESHOLD) {
                     s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_SLIDE_DOWN;
                     ESP_LOGI(TAG, "First reading: Slider initially at DOWN position (voltage=%d < %d mV)", 
@@ -412,6 +424,155 @@ typedef enum {
     MAG_POSITION_DOWN      // 在下面
 } mag_position_t;
 
+// 校准状态定义
+typedef enum {
+    CALIBRATION_IDLE = 0,           // 空闲状态
+    CALIBRATION_FIRST_POSITION,     // 校准第一个位置（等待稳定）
+    CALIBRATION_WAIT_SECOND,        // 等待移动到第二个位置
+    CALIBRATION_SECOND_POSITION,    // 校准第二个位置（等待稳定）
+    CALIBRATION_WAIT_THIRD,         // 等待移动到第三个位置
+    CALIBRATION_THIRD_POSITION,     // 校准第三个位置（等待稳定）
+    CALIBRATION_COMPLETED           // 校准完成
+} calibration_state_t;
+
+// 校准后的中心值（全局变量）
+static int16_t s_calibrated_removed_center = MAG_STATE_REMOVED_CENTER;
+static int16_t s_calibrated_up_center = MAG_STATE_UP_CENTER;
+static int16_t s_calibrated_down_center = MAG_STATE_DOWN_CENTER;
+
+// 重新校准标志（全局变量）
+static volatile bool s_request_recalibration = false;
+
+/**
+ * @brief 保存校准数据到 NVS
+ * 
+ * @param removed_center REMOVED 状态中心值
+ * @param up_center UP 状态中心值
+ * @param down_center DOWN 状态中心值
+ * @return esp_err_t 
+ */
+static esp_err_t save_calibration_to_nvs(int16_t removed_center, int16_t up_center, int16_t down_center)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+    
+    // 打开 NVS
+    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error opening NVS handle: %s", esp_err_to_name(err));
+        return err;
+    }
+    
+    // 保存三个中心值
+    err = nvs_set_i16(nvs_handle, NVS_KEY_REMOVED, removed_center);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error saving removed_center: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return err;
+    }
+    
+    err = nvs_set_i16(nvs_handle, NVS_KEY_UP, up_center);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error saving up_center: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return err;
+    }
+    
+    err = nvs_set_i16(nvs_handle, NVS_KEY_DOWN, down_center);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error saving down_center: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return err;
+    }
+    
+    // 设置校准标志
+    err = nvs_set_u8(nvs_handle, NVS_KEY_CALIBRATED, 1);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error saving calibrated flag: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return err;
+    }
+    
+    // 提交更改
+    err = nvs_commit(nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error committing NVS: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Calibration data saved to NVS successfully");
+    }
+    
+    // 关闭 NVS
+    nvs_close(nvs_handle);
+    
+    return err;
+}
+
+/**
+ * @brief 从 NVS 读取校准数据
+ * 
+ * @param removed_center 输出参数：REMOVED 状态中心值
+ * @param up_center 输出参数：UP 状态中心值
+ * @param down_center 输出参数：DOWN 状态中心值
+ * @return esp_err_t ESP_OK 表示读取成功，其他表示失败或未校准
+ */
+static esp_err_t load_calibration_from_nvs(int16_t *removed_center, int16_t *up_center, int16_t *down_center)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+    uint8_t calibrated = 0;
+    
+    // 打开 NVS
+    err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGI(TAG, "No calibration data found, need to calibrate");
+        } else {
+            ESP_LOGE(TAG, "Error opening NVS handle: %s", esp_err_to_name(err));
+        }
+        return err;
+    }
+    
+    // 检查是否已校准
+    err = nvs_get_u8(nvs_handle, NVS_KEY_CALIBRATED, &calibrated);
+    if (err != ESP_OK || calibrated != 1) {
+        ESP_LOGI(TAG, "Device not calibrated yet");
+        nvs_close(nvs_handle);
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    
+    // 读取三个中心值
+    err = nvs_get_i16(nvs_handle, NVS_KEY_REMOVED, removed_center);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error reading removed_center: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return err;
+    }
+    
+    err = nvs_get_i16(nvs_handle, NVS_KEY_UP, up_center);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error reading up_center: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return err;
+    }
+    
+    err = nvs_get_i16(nvs_handle, NVS_KEY_DOWN, down_center);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error reading down_center: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return err;
+    }
+    
+    // 关闭 NVS
+    nvs_close(nvs_handle);
+    
+    ESP_LOGI(TAG, "Calibration data loaded from NVS:");
+    ESP_LOGI(TAG, "  REMOVED center: %d", *removed_center);
+    ESP_LOGI(TAG, "  UP center: %d", *up_center);
+    ESP_LOGI(TAG, "  DOWN center: %d", *down_center);
+    
+    return ESP_OK;
+}
+
 static void magnetometer_read_task(void *arg)
 {
     ESP_LOGI(TAG, "Magnetometer read task started");
@@ -428,9 +589,21 @@ static void magnetometer_read_task(void *arg)
     static bool s_is_in_motion = false;  // 是否正在运动中
     static uint8_t s_stable_count = 0;   // 稳定计数器
     
-    // 单击检测
-    static uint8_t s_transition_count = 0;  // 过渡区停留次数
-    static mag_position_t s_before_transition = MAG_POSITION_UNKNOWN;  // 进入过渡区前的位置
+    // 单击检测 - 基于峰值检测
+    static int16_t s_down_baseline = 0;        // DOWN状态的基准值
+    static bool s_click_drop_detected = false;  // 检测到下降
+    static int16_t s_click_max_drop = 0;       // 记录最大下降量
+    static uint8_t s_click_duration = 0;       // 下降持续时间
+    static uint8_t s_recover_count = 0;        // 恢复计数
+    
+    // 校准相关变量
+    static calibration_state_t s_calibration_state = CALIBRATION_IDLE;
+    static uint8_t s_calibration_stable_count = 0;
+    static int16_t s_calibration_value = 0;
+    static int16_t s_calibration_last_average = 0;
+    static bool s_calibration_positions[3] = {false, false, false};  // 记录已校准的位置索引（0=REMOVED, 1=UP, 2=DOWN）
+    static int16_t s_calibration_temp_values[3] = {0};  // 临时存储校准值
+    static uint8_t s_calibration_settle_count = 0;  // 移动后沉淀计数器，确保数据真正稳定
 
 #ifdef CONFIG_SENSOR_BMM150
     if (bmm150_interface_init(&s_bmm150) != BMM150_OK) {
@@ -455,13 +628,61 @@ static void magnetometer_read_task(void *arg)
     }
 #endif
     
+    // 尝试从 NVS 加载校准数据
+    esp_err_t load_err = load_calibration_from_nvs(
+        &s_calibrated_removed_center,
+        &s_calibrated_up_center,
+        &s_calibrated_down_center
+    );
+    
+    if (load_err == ESP_OK) {
+        // 校准数据加载成功，跳过校准流程
+        ESP_LOGI(TAG, "========== Using Saved Calibration Data ==========");
+        s_calibration_state = CALIBRATION_COMPLETED;
+    } else {
+        // 没有校准数据或加载失败，启动校准流程
+        ESP_LOGI(TAG, "========== Magnetometer Calibration Started ==========");
+        ESP_LOGI(TAG, "Please keep the slider in current position and wait for calibration...");
+        s_calibration_state = CALIBRATION_FIRST_POSITION;
+    }
+    
     while (1) {
+        // 检查是否需要重新校准
+        if (s_request_recalibration && s_calibration_state == CALIBRATION_COMPLETED) {
+            ESP_LOGI(TAG, "========== Re-calibration Requested ==========");
+            ESP_LOGI(TAG, "Please keep the slider in current position and wait for calibration...");
+            
+            // 重置校准状态
+            s_calibration_state = CALIBRATION_FIRST_POSITION;
+            s_calibration_stable_count = 0;
+            s_calibration_value = 0;
+            s_calibration_last_average = 0;
+            s_calibration_settle_count = 0;  // 重置沉淀计数器
+            s_calibration_positions[0] = false;
+            s_calibration_positions[1] = false;
+            s_calibration_positions[2] = false;
+            s_calibration_temp_values[0] = 0;
+            s_calibration_temp_values[1] = 0;
+            s_calibration_temp_values[2] = 0;
+            
+            // 重置窗口
+            s_window_filled = 0;
+            s_window_index = 0;
+            
+            // 清除请求标志
+            s_request_recalibration = false;
+        }
+        
         int8_t ret = ESP_FAIL;
         int16_t s_mag_value = 0;
         
 #ifdef CONFIG_SENSOR_BMM150
         struct bmm150_mag_data mag = { 0 };
         ret = bmm150_read_mag_data(&mag, &s_bmm150);
+
+        // ESP_LOGI(TAG, "BMM150 mag value: %d, %d, %d", mag.x, mag.y, mag.z);
+        // vTaskDelay(pdMS_TO_TICKS(200));
+
         s_mag_value = mag.z;
 #elif defined(CONFIG_SENSOR_QMC6309)
         int16_t qmc_x, qmc_y, qmc_z;
@@ -469,6 +690,7 @@ static void magnetometer_read_task(void *arg)
         s_mag_value = -qmc_z / 10;
 #endif
         
+#if 1
         if (ret == ESP_OK) {
             // 1. 更新滑动窗口
             s_window[s_window_index] = s_mag_value;
@@ -486,37 +708,419 @@ static void magnetometer_read_task(void *arg)
                 int16_t average = sum / MAG_WINDOW_SIZE;
                 // printf("average: %d\n", average);
                 
-                // 3. 根据平均值判断当前位置状态
+                // ========== 校准状态机 ==========
+                if (s_calibration_state != CALIBRATION_COMPLETED) {
+                    // 正在校准中，不执行正常的动作识别逻辑
+                    
+                    switch (s_calibration_state) {
+                        case CALIBRATION_FIRST_POSITION:
+                        {
+                            // 检查数值稳定性（需要更严格）
+                            if (s_calibration_last_average == 0) {
+                                // 第一次读取，初始化
+                                s_calibration_last_average = average;
+                                s_calibration_stable_count = 0;
+                            } else {
+                                int16_t diff = abs(average - s_calibration_last_average);
+                                
+                                if (diff < 5) {  // 变化小于5，认为稳定（更严格）
+                                    s_calibration_stable_count++;
+                                    
+                                    if (s_calibration_stable_count >= MAG_STABLE_THRESHOLD * 3) {  // 需要更长时间稳定
+                                        // 稳定足够久，记录第一个位置
+                                        s_calibration_value = average;
+                                        
+                                        // 判断最接近哪个预设值
+                                        int16_t diff_removed = abs(average - MAG_STATE_REMOVED_CENTER);
+                                        int16_t diff_up = abs(average - MAG_STATE_UP_CENTER);
+                                        int16_t diff_down = abs(average - MAG_STATE_DOWN_CENTER);
+                                        
+                                        if (diff_removed < diff_up && diff_removed < diff_down) {
+                                            s_calibration_temp_values[0] = average;
+                                            s_calibration_positions[0] = true;
+                                            ESP_LOGI(TAG, "First position calibrated as REMOVED: %d", average);
+                                        } else if (diff_up < diff_down) {
+                                            s_calibration_temp_values[1] = average;
+                                            s_calibration_positions[1] = true;
+                                            ESP_LOGI(TAG, "First position calibrated as UP: %d", average);
+                                        } else {
+                                            s_calibration_temp_values[2] = average;
+                                            s_calibration_positions[2] = true;
+                                            ESP_LOGI(TAG, "First position calibrated as DOWN: %d", average);
+                                        }
+                                        
+                                        // 进入下一个状态
+                                        s_calibration_state = CALIBRATION_WAIT_SECOND;
+                                        s_calibration_stable_count = 0;
+                                        s_calibration_settle_count = 0;  // 重置沉淀计数器
+                                        ESP_LOGI(TAG, "Please move the slider to another position...");
+                                    }
+                                } else {
+                                    // 数值还在变化，重置稳定计数
+                                    s_calibration_stable_count = 0;
+                                }
+                                
+                                s_calibration_last_average = average;
+                            }
+                            break;
+                        }
+                        
+                        case CALIBRATION_WAIT_SECOND:
+                        {
+                            // 等待数据发生变化（说明用户移动了滑块）
+                            int16_t change = abs(average - s_calibration_value);
+                            
+                            // 检测到移动后,先沉淀一段时间,确保数据稳定
+                            if (s_calibration_settle_count > 0) {
+                                // 已经检测到移动,正在沉淀期
+                                int16_t settle_diff = abs(average - s_calibration_last_average);
+                                
+                                if (settle_diff < 10) {
+                                    // 数据变化很小,认为正在稳定
+                                    s_calibration_settle_count++;
+                                    
+                                    // 沉淀时间足够(约500ms),进入稳定性检查状态
+                                    if (s_calibration_settle_count >= MAG_STABLE_THRESHOLD * 2) {
+                                        ESP_LOGI(TAG, "Data settled at %d, starting position recording...", average);
+                                        s_calibration_state = CALIBRATION_SECOND_POSITION;
+                                        s_calibration_stable_count = 0;
+                                        s_calibration_last_average = 0;  // 重置,强制第一次读取
+                                        s_calibration_settle_count = 0;
+                                    }
+                                } else {
+                                    // 数据还在大幅变化,重置沉淀计数(滑块还在移动中)
+                                    s_calibration_settle_count = 1;
+                                }
+                                
+                                s_calibration_last_average = average;
+                            } else {
+                                // 还未检测到移动,等待变化
+                                if (change > 100) {
+                                    ESP_LOGI(TAG, "Movement detected (change=%d), waiting for data to settle...", change);
+                                    s_calibration_settle_count = 1;  // 开始沉淀期
+                                    s_calibration_last_average = average;
+                                }
+                            }
+                            break;
+                        }
+                        
+                        case CALIBRATION_SECOND_POSITION:
+                        {
+                            // 检查数值稳定性（需要更严格）
+                            if (s_calibration_last_average == 0) {
+                                // 第一次读取，初始化
+                                s_calibration_last_average = average;
+                                s_calibration_stable_count = 0;
+                            } else {
+                                int16_t diff = abs(average - s_calibration_last_average);
+                                
+                                if (diff < 5) {  // 变化小于5，认为稳定（更严格）
+                                    s_calibration_stable_count++;
+                                    
+                                    if (s_calibration_stable_count >= MAG_STABLE_THRESHOLD * 3) {  // 需要更长时间稳定
+                                        // 稳定足够久，记录第二个位置
+                                        s_calibration_value = average;
+                                        
+                                        // 判断最接近哪个未校准的预设值
+                                        int16_t min_diff = 32767;
+                                        int best_index = -1;
+                                        
+                                        if (!s_calibration_positions[0]) {
+                                            int16_t diff = abs(average - MAG_STATE_REMOVED_CENTER);
+                                            if (diff < min_diff) {
+                                                min_diff = diff;
+                                                best_index = 0;
+                                            }
+                                        }
+                                        if (!s_calibration_positions[1]) {
+                                            int16_t diff = abs(average - MAG_STATE_UP_CENTER);
+                                            if (diff < min_diff) {
+                                                min_diff = diff;
+                                                best_index = 1;
+                                            }
+                                        }
+                                        if (!s_calibration_positions[2]) {
+                                            int16_t diff = abs(average - MAG_STATE_DOWN_CENTER);
+                                            if (diff < min_diff) {
+                                                min_diff = diff;
+                                                best_index = 2;
+                                            }
+                                        }
+                                        
+                                    if (best_index >= 0) {
+                                        s_calibration_temp_values[best_index] = average;
+                                        s_calibration_positions[best_index] = true;
+                                        const char *pos_names[] = {"REMOVED", "UP", "DOWN"};
+                                        ESP_LOGI(TAG, "Second position calibrated as %s: %d", 
+                                                 pos_names[best_index], average);
+                                    }
+                                    
+                                    // 进入下一个状态
+                                    s_calibration_state = CALIBRATION_WAIT_THIRD;
+                                    s_calibration_stable_count = 0;
+                                    s_calibration_settle_count = 0;  // 重置沉淀计数器
+                                    ESP_LOGI(TAG, "Please move the slider to the last position...");
+                                    
+                                    // 发送 0x11 通知头部：第二个位置已完成，请提示用户进行第三个动作
+                                    control_serial_send_magnetic_switch_calibration_step(MAG_SWITCH_CALIB_FIRST_DONE);
+                                    }
+                                } else {
+                                    // 数值还在变化，重置稳定计数
+                                    s_calibration_stable_count = 0;
+                                }
+                                
+                                s_calibration_last_average = average;
+                            }
+                            break;
+                        }
+                        
+                        case CALIBRATION_WAIT_THIRD:
+                        {
+                            // 等待数据发生变化
+                            int16_t change = abs(average - s_calibration_value);
+                            
+                            // 检测到移动后,先沉淀一段时间,确保数据稳定
+                            if (s_calibration_settle_count > 0) {
+                                // 已经检测到移动,正在沉淀期
+                                int16_t settle_diff = abs(average - s_calibration_last_average);
+                                
+                                if (settle_diff < 10) {
+                                    // 数据变化很小,认为正在稳定
+                                    s_calibration_settle_count++;
+                                    
+                                    // 沉淀时间足够(约500ms),进入稳定性检查状态
+                                    if (s_calibration_settle_count >= MAG_STABLE_THRESHOLD * 2) {
+                                        ESP_LOGI(TAG, "Data settled at %d, starting position recording...", average);
+                                        s_calibration_state = CALIBRATION_THIRD_POSITION;
+                                        s_calibration_stable_count = 0;
+                                        s_calibration_last_average = 0;  // 重置,强制第一次读取
+                                        s_calibration_settle_count = 0;
+                                    }
+                                } else {
+                                    // 数据还在大幅变化,重置沉淀计数(滑块还在移动中)
+                                    s_calibration_settle_count = 1;
+                                }
+                                
+                                s_calibration_last_average = average;
+                            } else {
+                                // 还未检测到移动,等待变化
+                                if (change > 100) {
+                                    ESP_LOGI(TAG, "Movement detected (change=%d), waiting for data to settle...", change);
+                                    s_calibration_settle_count = 1;  // 开始沉淀期
+                                    s_calibration_last_average = average;
+                                }
+                            }
+                            break;
+                        }
+                        
+                        case CALIBRATION_THIRD_POSITION:
+                        {
+                            // 检查数值稳定性（需要更严格）
+                            if (s_calibration_last_average == 0) {
+                                // 第一次读取，初始化
+                                s_calibration_last_average = average;
+                                s_calibration_stable_count = 0;
+                            } else {
+                                int16_t diff = abs(average - s_calibration_last_average);
+                                
+                                if (diff < 5) {  // 变化小于5，认为稳定（更严格）
+                                    s_calibration_stable_count++;
+                                    
+                                    if (s_calibration_stable_count >= MAG_STABLE_THRESHOLD * 3) {  // 需要更长时间稳定
+                                        // 稳定足够久，记录第三个位置
+                                        
+                                    // 找到最后一个未校准的位置
+                                    for (int i = 0; i < 3; i++) {
+                                        if (!s_calibration_positions[i]) {
+                                            s_calibration_temp_values[i] = average;
+                                            s_calibration_positions[i] = true;
+                                            const char *pos_names[] = {"REMOVED", "UP", "DOWN"};
+                                            ESP_LOGI(TAG, "Third position calibrated as %s: %d", 
+                                                     pos_names[i], average);
+                                            break;
+                                        }
+                                    }
+                                        
+                                        // 校准完成，按照大小关系重新排序
+                                        // REMOVED一定是最小值，UP是中间值，DOWN是最大值
+                                        int16_t sorted_values[3];
+                                        sorted_values[0] = s_calibration_temp_values[0];
+                                        sorted_values[1] = s_calibration_temp_values[1];
+                                        sorted_values[2] = s_calibration_temp_values[2];
+                                        
+                                        // 简单冒泡排序
+                                        for (int i = 0; i < 2; i++) {
+                                            for (int j = 0; j < 2 - i; j++) {
+                                                if (sorted_values[j] > sorted_values[j + 1]) {
+                                                    int16_t temp = sorted_values[j];
+                                                    sorted_values[j] = sorted_values[j + 1];
+                                                    sorted_values[j + 1] = temp;
+                                                }
+                                            }
+                                        }
+                                        
+                                        // 按照大小关系赋值：最小=REMOVED，中间=UP，最大=DOWN
+                                        s_calibrated_removed_center = sorted_values[0];
+                                        s_calibrated_up_center = sorted_values[1];
+                                        s_calibrated_down_center = sorted_values[2];
+                                        
+                                        s_calibration_state = CALIBRATION_COMPLETED;
+                                        
+                                        ESP_LOGI(TAG, "========== Calibration Completed ==========");
+                                        ESP_LOGI(TAG, "Calibrated values (sorted by magnitude):");
+                                        ESP_LOGI(TAG, "  REMOVED center: %d (default: %d)", 
+                                                 s_calibrated_removed_center, MAG_STATE_REMOVED_CENTER);
+                                        ESP_LOGI(TAG, "  UP center: %d (default: %d)", 
+                                                 s_calibrated_up_center, MAG_STATE_UP_CENTER);
+                                        ESP_LOGI(TAG, "  DOWN center: %d (default: %d)", 
+                                                 s_calibrated_down_center, MAG_STATE_DOWN_CENTER);
+                                        
+                                        // 保存校准数据到 NVS
+                                        esp_err_t save_err = save_calibration_to_nvs(
+                                            s_calibrated_removed_center,
+                                            s_calibrated_up_center,
+                                            s_calibrated_down_center
+                                        );
+                                        
+                                        if (save_err == ESP_OK) {
+                                            ESP_LOGI(TAG, "Calibration data saved to Flash successfully");
+                                        } else {
+                                            ESP_LOGW(TAG, "Failed to save calibration data to Flash: %s", 
+                                                     esp_err_to_name(save_err));
+                                        }
+                                        
+                                        ESP_LOGI(TAG, "Normal operation started.");
+                                        
+                                        // 发送 0x12 通知头部：校准完成
+                                        control_serial_send_magnetic_switch_calibration_step(MAG_SWITCH_CALIB_COMPLETE);
+                                    }
+                                } else {
+                                    // 数值还在变化，重置稳定计数
+                                    s_calibration_stable_count = 0;
+                                }
+                                
+                                s_calibration_last_average = average;
+                            }
+                            break;
+                        }
+                        
+                        default:
+                            break;
+                    }
+                    
+                    // 校准期间不执行后续的动作识别逻辑
+                    vTaskDelay(pdMS_TO_TICKS(MAG_SAMPLE_PERIOD_MS));
+                    continue;
+                }
+                
+                // ========== 正常运行模式（校准完成后） ==========
+                // printf("average: %d\n", average);
+                
+                // 3. 根据平均值判断当前位置状态（使用校准后的值）
                 mag_position_t detected_position = MAG_POSITION_UNKNOWN;
                 
-                if (average >= MAG_STATE_REMOVED_MIN && average <= MAG_STATE_REMOVED_MAX) {
+                // 使用校准后的中心值计算状态范围
+                int16_t calibrated_removed_min = s_calibrated_removed_center - MAG_STATE_REMOVED_OFFSET;
+                int16_t calibrated_removed_max = s_calibrated_removed_center + MAG_STATE_REMOVED_OFFSET;
+                int16_t calibrated_up_min = s_calibrated_up_center - MAG_STATE_UP_OFFSET;
+                int16_t calibrated_up_max = s_calibrated_up_center + MAG_STATE_UP_OFFSET;
+                int16_t calibrated_down_min = s_calibrated_down_center - MAG_STATE_DOWN_OFFSET;
+                int16_t calibrated_down_max = s_calibrated_down_center + MAG_STATE_DOWN_OFFSET;
+                
+                if (average >= calibrated_removed_min && average <= calibrated_removed_max) {
                     detected_position = MAG_POSITION_REMOVED;  // 拿掉
-                } else if (average >= MAG_STATE_UP_MIN && average <= MAG_STATE_UP_MAX) {
+                } else if (average >= calibrated_up_min && average <= calibrated_up_max) {
                     detected_position = MAG_POSITION_UP;       // 上面
-                } else if (average >= MAG_STATE_DOWN_MIN && average <= MAG_STATE_DOWN_MAX) {
+                } else if (average >= calibrated_down_min && average <= calibrated_down_max) {
                     detected_position = MAG_POSITION_DOWN;     // 下面
                 }
                 
-                // 4. 稳定性检测和事件触发
+                // 4. 单击检测 - 基于峰值检测（不使用平均值）
+                if (s_current_position == MAG_POSITION_DOWN) {
+                    // 在 DOWN 状态下，监测磁场值的快速下降和恢复
+                    
+                    // 更新基准值（使用平滑更新，避免噪声影响）
+                    if (s_down_baseline == 0) {
+                        s_down_baseline = s_mag_value;  // 首次初始化
+                    } else if (!s_click_drop_detected) {
+                        // 未检测到下降时，缓慢跟踪基准值
+                        s_down_baseline = (s_down_baseline * 9 + s_mag_value) / 10;
+                    }
+                    
+                    // 检测下降（实时值相对基准值）
+                    int16_t drop_value = s_down_baseline - s_mag_value;
+                    
+                    if (!s_click_drop_detected && drop_value >= MAG_CLICK_DROP_THRESHOLD) {
+                        // 首次检测到下降，进入单击检测模式
+                        s_click_drop_detected = true;
+                        s_click_max_drop = drop_value;
+                        s_click_duration = 1;
+                        s_recover_count = 0;
+                        // printf("Click started: baseline=%d, current=%d, drop=%d\n", 
+                        //        s_down_baseline, s_mag_value, drop_value);
+                    } else if (s_click_drop_detected) {
+                        // 已进入单击检测模式
+                        s_click_duration++;
+                        
+                        // 更新最大下降量
+                        if (drop_value > s_click_max_drop) {
+                            s_click_max_drop = drop_value;
+                        }
+                        
+                        // 检测恢复：当前下降值小于最大下降的40%，认为开始恢复
+                        if (drop_value < (s_click_max_drop * 4 / 10)) {
+                            s_recover_count++;
+                            
+                            // 恢复稳定，触发单击事件
+                            if (s_recover_count >= MAG_STABLE_THRESHOLD) {
+                                s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_SINGLE_CLICK;
+                                ESP_LOGI(TAG, "SINGLE_CLICK detected (max_drop=%d, duration=%d)", 
+                                         s_click_max_drop, s_click_duration);
+                                
+                                // 发送事件通知
+                                control_serial_send_magnetic_switch_event(s_slider_state);
+                                
+                                // ESP_LOGI(TAG, "--------------------------------\n");
+                                
+                                // 重置单击检测
+                                s_click_drop_detected = false;
+                                s_click_max_drop = 0;
+                                s_click_duration = 0;
+                                s_recover_count = 0;
+                                s_down_baseline = s_mag_value;
+                            }
+                        } else {
+                            // 还未恢复，重置恢复计数
+                            s_recover_count = 0;
+                        }
+                        
+                        // 超时检测：持续时间过长（>200ms），重置
+                        if (s_click_duration > MAG_CLICK_TRANSITION_MAX_COUNT * 2) {
+                            // printf("Click timeout: duration=%d, max_drop=%d\n", 
+                            //        s_click_duration, s_click_max_drop);
+                            s_click_drop_detected = false;
+                            s_click_max_drop = 0;
+                            s_click_duration = 0;
+                            s_recover_count = 0;
+                            s_down_baseline = s_mag_value;
+                        }
+                    }
+                } else {
+                    // 不在 DOWN 状态，重置单击检测
+                    s_click_drop_detected = false;
+                    s_click_max_drop = 0;
+                    s_click_duration = 0;
+                    s_recover_count = 0;
+                    s_down_baseline = 0;
+                }
+                
+                // 5. 稳定性检测和滑动事件触发
                 if (detected_position == MAG_POSITION_UNKNOWN) {
                     // 处于过渡区域（不在任何定义的状态范围内）
                     if (!s_is_in_motion && s_current_position != MAG_POSITION_UNKNOWN) {
                         // 刚离开稳定状态，记录运动起始位置
                         s_motion_start_position = s_current_position;
                         s_is_in_motion = true;
-                        
-                        // 单击检测：记录进入过渡区前的位置
-                        if (s_current_position == MAG_POSITION_DOWN) {
-                            s_before_transition = s_current_position;
-                            s_transition_count = 0;
-                        }
-                        // ESP_LOGI(TAG, "Motion started from position %d (avg=%d)", 
-                        //          s_motion_start_position, average);
-                    }
-                    
-                    // 单击检测：在过渡区累积计数
-                    if (s_before_transition == MAG_POSITION_DOWN) {
-                        s_transition_count++;
                     }
                     
                     // 重置候选状态和稳定计数
@@ -525,46 +1129,7 @@ static void magnetometer_read_task(void *arg)
                 }
                 else {
                     // 检测到有效状态（REMOVED/UP/DOWN）
-                    
-                    // 单击检测：从DOWN短暂离开又快速回到DOWN
-                    if (s_before_transition == MAG_POSITION_DOWN && 
-                        detected_position == MAG_POSITION_DOWN) {
-                        
-                        // printf("Click check: count=%d, max=%d, threshold=%d\n", 
-                        //        s_transition_count, MAG_CLICK_TRANSITION_MAX_COUNT, MAG_STABLE_THRESHOLD);
-                        
-                        if (s_transition_count > 0 && 
-                            s_transition_count <= MAG_CLICK_TRANSITION_MAX_COUNT) {
-                            // 回到DOWN状态，检查是否是单击
-                            if (detected_position == s_candidate_position) {
-                                s_stable_count++;
-                            } else {
-                                s_candidate_position = detected_position;
-                                s_stable_count = 1;
-                            }
-                            
-                            // printf("Click candidate: stable_count=%d\n", s_stable_count);
-                            
-                            // 稳定后触发单击
-                            if (s_stable_count >= MAG_STABLE_THRESHOLD) {
-                                s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_SINGLE_CLICK;
-                                ESP_LOGI(TAG, "SINGLE_CLICK (transition_count=%d)", s_transition_count);
-                                
-                                // 重置单击检测
-                                s_before_transition = MAG_POSITION_UNKNOWN;
-                                s_transition_count = 0;
-                                s_is_in_motion = false;
-                                
-                                ESP_LOGI(TAG, "--------------------------------\n");
-                            }
-                        } else {
-                            // 过渡时间太长，不是单击，重置
-                            printf("Click timeout: count=%d > max=%d\n", s_transition_count, MAG_CLICK_TRANSITION_MAX_COUNT);
-                            // s_before_transition = MAG_POSITION_UNKNOWN;
-                            s_transition_count = 0;
-                        }
-                    }
-                    else if (detected_position == s_candidate_position) {
+                    if (detected_position == s_candidate_position) {
                         // 候选状态保持不变，累积稳定计数
                         s_stable_count++;
                         
@@ -572,51 +1137,64 @@ static void magnetometer_read_task(void *arg)
                         if (s_stable_count >= MAG_STABLE_THRESHOLD && 
                             detected_position != s_current_position) {
                             // 新状态已稳定，可以触发事件
-                            // ESP_LOGI(TAG, "Position confirmed: %d -> %d (avg=%d)", 
-                            //          s_motion_start_position, detected_position, average);
                             
                             // 只在运动过程中触发事件（避免初始化时误触发）
                             if (s_is_in_motion && s_motion_start_position != MAG_POSITION_UNKNOWN) {
+                                magnetic_slide_switch_event_t event = MAGNETIC_SLIDE_SWITCH_EVENT_INIT;
+                                
                                 // 根据起始位置和目标位置判断事件
                                 if (s_motion_start_position == MAG_POSITION_UP && 
                                     detected_position == MAG_POSITION_DOWN) {
-                                    s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_SLIDE_DOWN;
+                                    event = MAGNETIC_SLIDE_SWITCH_EVENT_SLIDE_DOWN;
                                     ESP_LOGI(TAG, "SLIDE_DOWN");
                                 }
                                 else if (s_motion_start_position == MAG_POSITION_DOWN && 
                                          detected_position == MAG_POSITION_UP) {
-                                    s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_SLIDE_UP;
+                                    event = MAGNETIC_SLIDE_SWITCH_EVENT_SLIDE_UP;
                                     ESP_LOGI(TAG, "SLIDE_UP");
                                 }
                                 else if (s_motion_start_position == MAG_POSITION_UP && 
                                          detected_position == MAG_POSITION_REMOVED) {
-                                    s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_REMOVE_FROM_UP;
+                                    event = MAGNETIC_SLIDE_SWITCH_EVENT_REMOVE_FROM_UP;
                                     ESP_LOGI(TAG, "REMOVE_FROM_UP");
                                 }
                                 else if (s_motion_start_position == MAG_POSITION_DOWN && 
                                          detected_position == MAG_POSITION_REMOVED) {
-                                    s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_REMOVE_FROM_DOWN;
+                                    event = MAGNETIC_SLIDE_SWITCH_EVENT_REMOVE_FROM_DOWN;
                                     ESP_LOGI(TAG, "REMOVE_FROM_DOWN");
                                 }
                                 else if (s_motion_start_position == MAG_POSITION_REMOVED && 
                                          detected_position == MAG_POSITION_UP) {
-                                    s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_PLACE_FROM_UP;
+                                    event = MAGNETIC_SLIDE_SWITCH_EVENT_PLACE_FROM_UP;
                                     ESP_LOGI(TAG, "PLACE_FROM_UP");
                                 }
                                 else if (s_motion_start_position == MAG_POSITION_REMOVED && 
                                          detected_position == MAG_POSITION_DOWN) {
-                                    s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_PLACE_FROM_DOWN;
+                                    event = MAGNETIC_SLIDE_SWITCH_EVENT_PLACE_FROM_DOWN;
                                     ESP_LOGI(TAG, "PLACE_FROM_DOWN");
                                 }
                                 
-                                // 重置单击检测
-                                s_before_transition = MAG_POSITION_UNKNOWN;
-                                s_transition_count = 0;
+                                // 更新状态并发送事件
+                                if (event != MAGNETIC_SLIDE_SWITCH_EVENT_INIT) {
+                                    s_slider_state = event;
+                                    control_serial_send_magnetic_switch_event(event);
+                                    
+                                    // 只在触发事件后才更新运动起始位置
+                                    // 这样可以正确处理连续的动作序列
+                                    s_motion_start_position = detected_position;
+                                }
+                                
+                                // ESP_LOGI(TAG, "--------------------------------\n");
+                            } else {
+                                // 初始化或没有触发事件时，也更新起始位置
+                                // 这是第一次检测到位置，或者状态未变化
+                                if (s_current_position == MAG_POSITION_UNKNOWN) {
+                                    s_motion_start_position = detected_position;
+                                }
                             }
-                            ESP_LOGI(TAG, "--------------------------------\n");
+                            
                             // 更新当前位置，清除运动标志
                             s_current_position = detected_position;
-                            s_motion_start_position = detected_position;
                             s_is_in_motion = false;
                         }
                     }
@@ -624,13 +1202,6 @@ static void magnetometer_read_task(void *arg)
                         // 检测到新的候选状态，重新开始稳定性验证
                         s_candidate_position = detected_position;
                         s_stable_count = 1;
-                        
-                        // 如果候选状态不是DOWN，重置单击检测
-                        if (detected_position != MAG_POSITION_DOWN && s_before_transition == MAG_POSITION_DOWN) {
-                            // 过渡到其他稳定状态，不是单击
-                            s_before_transition = MAG_POSITION_UNKNOWN;
-                            s_transition_count = 0;
-                        }
                     }
                 }
             }
@@ -639,6 +1210,7 @@ static void magnetometer_read_task(void *arg)
         }
         
         vTaskDelay(pdMS_TO_TICKS(MAG_SAMPLE_PERIOD_MS));
+#endif
     }
 
 cleanup:
@@ -655,8 +1227,25 @@ cleanup:
 void magnetic_slide_switch_start(void)
 {
 #ifdef CONFIG_SENSOR_LINEAR_HALL
-    xTaskCreate(hall_sensor_read_task, "hall_sensor_read_task", MAGNETIC_SLIDE_SWITCH_TASK_STACK_SIZE, NULL, 5, NULL);
+    xTaskCreate(hall_sensor_read_task, "hall_sensor_read_task", MAGNETIC_SLIDE_SWITCH_TASK_STACK_SIZE, NULL, 2, NULL);
 #elif defined(CONFIG_SENSOR_MAGNETOMETER)
-    xTaskCreate(magnetometer_read_task, "magnetometer_read_task", MAGNETIC_SLIDE_SWITCH_TASK_STACK_SIZE, NULL, 5, NULL);
+    xTaskCreate(magnetometer_read_task, "magnetometer_read_task", MAGNETIC_SLIDE_SWITCH_TASK_STACK_SIZE, NULL, 2, NULL);
 #endif
+}
+
+magnetic_slide_switch_event_t magnetic_slide_switch_get_event(void)
+{
+    return s_slider_state;
+}
+
+/**
+ * @brief 触发重新校准（无需重启，立即生效）
+ * 
+ * 此函数设置重新校准标志，magnetometer_read_task 将在下一次循环中
+ * 自动重新进入校准模式，校准完成后会覆盖之前保存的校准数据。
+ */
+void magnetic_slide_switch_start_recalibration(void)
+{
+    ESP_LOGI(TAG, "Recalibration request received");
+    s_request_recalibration = true;
 }

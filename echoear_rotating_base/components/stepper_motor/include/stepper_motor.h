@@ -23,9 +23,23 @@ extern "C" {
 #define STEPPER_ACCEL_STEPS         30     // 加速步数
 #define STEPPER_DECEL_STEPS         30     // 减速步数
 
+// 步进电机动作类型枚举
+typedef enum {
+    STEPPER_ACTION_SHAKE_HEAD,          // 摇头动作（固定幅度和次数）
+    STEPPER_ACTION_SHAKE_HEAD_DECAY,    // 渐变递减摇头动作
+    STEPPER_ACTION_LOOK_AROUND,         // 左顾右盼观察动作
+    STEPPER_ACTION_BEAT_SWING,          // 跟随鼓点左右摆头
+    STEPPER_ACTION_CAT_NUZZLE,          // 猫咪蹭手动作
+    STEPPER_ACTION_MAX                  // 动作类型数量（用于边界检查）
+} stepper_action_type_t;
+
 void stepper_rotate_angle(float angle, int delay_us);
 void stepper_rotate_angle_with_accel(float angle, int target_delay_us);
 void stepper_shake_head(float amplitude, int cycles, int speed_us);
+void stepper_shake_head_decay(float initial_amplitude, float decay_rate, int speed_us);
+void stepper_look_around(float left_angle, float right_angle, float scan_angle, int pause_ms, int large_speed_us, int small_speed_us);
+void stepper_beat_swing(float angle, int speed_us);
+void stepper_cat_nuzzle(float angle, int cycles, int speed_us);
 void stepper_motor_power_off(void);
 void stepper_motor_gpio_init(void);
 
