@@ -1,4 +1,4 @@
 idf_component_register(SRCS "magnetic_slide_switch.c"
                     INCLUDE_DIRS "include"
                     REQUIRES espressif__i2c_bus BMM150_SensorAPI
-                    PRIV_REQUIRES esp_adc)
+                    PRIV_REQUIRES esp_adc control_serial)

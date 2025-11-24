@@ -30,27 +30,27 @@ extern "C" {
     #define MAGNETOMETER_I2C_ADDR           (0x10)      // BMM150 I2C地址
     #define MAGNETOMETER_CHIP_ID            (0x32)      // BMM150芯片ID
 
-     // 滑动窗口配置
-     #define MAG_WINDOW_SIZE                     (5)        // 滑动窗口大小
-     #define MAG_SAMPLE_PERIOD_MS                (5)         // 采样周期(ms) - 越小响应越快
-     #define MAG_STABLE_THRESHOLD                (5)         // 连续 N 次相同状态才认为稳定
-     
-     // 单击检测配置
-     #define MAG_CLICK_TRANSITION_MAX_COUNT      (10)        // 单击过渡区最大停留次数
-     #define MAG_CLICK_DROP_THRESHOLD            (30)        // 单击时的下降阈值
+    // 滑动窗口配置
+    #define MAG_WINDOW_SIZE                     (5)        // 滑动窗口大小
+    #define MAG_SAMPLE_PERIOD_MS                (5)         // 采样周期(ms) - 越小响应越快
+    #define MAG_STABLE_THRESHOLD                (5)         // 连续 N 次相同状态才认为稳定
+    
+    // 单击检测配置
+    #define MAG_CLICK_TRANSITION_MAX_COUNT      (30)        // 单击下降最大持续次数（20次*5ms=100ms）
+    #define MAG_CLICK_DROP_THRESHOLD            (60)       // 单击时的下降阈值（磁场值变化）
 
     // 状态阈值配置：中心值 ± 偏移量
-    #define MAG_STATE_REMOVED_CENTER        (1137)      // 拿掉状态中心值
+    #define MAG_STATE_REMOVED_CENTER        (1230)      // 拿掉状态中心值
     #define MAG_STATE_REMOVED_OFFSET        (100)        // 拿掉状态偏移量
     #define MAG_STATE_REMOVED_MIN           (MAG_STATE_REMOVED_CENTER - MAG_STATE_REMOVED_OFFSET)
     #define MAG_STATE_REMOVED_MAX           (MAG_STATE_REMOVED_CENTER + MAG_STATE_REMOVED_OFFSET)
     
-    #define MAG_STATE_UP_CENTER             (1428)      // 上面状态中心值
+    #define MAG_STATE_UP_CENTER             (1619)      // 上面状态中心值
     #define MAG_STATE_UP_OFFSET             (100)        // 上面状态偏移量
     #define MAG_STATE_UP_MIN                (MAG_STATE_UP_CENTER - MAG_STATE_UP_OFFSET)
     #define MAG_STATE_UP_MAX                (MAG_STATE_UP_CENTER + MAG_STATE_UP_OFFSET)
     
-    #define MAG_STATE_DOWN_CENTER           (1830)      // 下面状态中心值
+    #define MAG_STATE_DOWN_CENTER           (1894)      // 下面状态中心值
     #define MAG_STATE_DOWN_OFFSET           (100)        // 下面状态偏移量
     #define MAG_STATE_DOWN_MIN              (MAG_STATE_DOWN_CENTER - MAG_STATE_DOWN_OFFSET)
     #define MAG_STATE_DOWN_MAX              (MAG_STATE_DOWN_CENTER + MAG_STATE_DOWN_OFFSET)
@@ -60,27 +60,27 @@ extern "C" {
     #define MAGNETOMETER_I2C_ADDR           (0x7C)      // QMC6309 I2C地址
     #define MAGNETOMETER_CHIP_ID            (0x90)      // QMC6309芯片ID
 
-     // 滑动窗口配置
-     #define MAG_WINDOW_SIZE                     (5)        // 滑动窗口大小
-     #define MAG_SAMPLE_PERIOD_MS                (2)         // 采样周期(ms) - 越小响应越快
-     #define MAG_STABLE_THRESHOLD                (10)         // 连续 N 次相同状态才认为稳定
-     
-     // 单击检测配置
-     #define MAG_CLICK_TRANSITION_MAX_COUNT      (100)        // 单击过渡区最大停留次数
-     #define MAG_CLICK_DROP_THRESHOLD            (10)        // 单击时的下降阈值
+    // 滑动窗口配置
+    #define MAG_WINDOW_SIZE                     (5)        // 滑动窗口大小
+    #define MAG_SAMPLE_PERIOD_MS                (2)         // 采样周期(ms) - 越小响应越快
+    #define MAG_STABLE_THRESHOLD                (10)         // 连续 N 次相同状态才认为稳定
+    
+    // 单击检测配置
+    #define MAG_CLICK_TRANSITION_MAX_COUNT      (20)        // 单击下降最大持续次数（20次*5ms=100ms）
+    #define MAG_CLICK_DROP_THRESHOLD            (60)       // 单击时的下降阈值（磁场值变化）
 
     // 状态阈值配置：中心值 ± 偏移量
-    #define MAG_STATE_REMOVED_CENTER        (1234)      // 拿掉状态中心值
+    #define MAG_STATE_REMOVED_CENTER        (1096)      // 拿掉状态中心值
     #define MAG_STATE_REMOVED_OFFSET        (100)        // 拿掉状态偏移量
     #define MAG_STATE_REMOVED_MIN           (MAG_STATE_REMOVED_CENTER - MAG_STATE_REMOVED_OFFSET)
     #define MAG_STATE_REMOVED_MAX           (MAG_STATE_REMOVED_CENTER + MAG_STATE_REMOVED_OFFSET)
     
-    #define MAG_STATE_UP_CENTER             (1562)      // 上面状态中心值
+    #define MAG_STATE_UP_CENTER             (1422)      // 上面状态中心值
     #define MAG_STATE_UP_OFFSET             (100)        // 上面状态偏移量
     #define MAG_STATE_UP_MIN                (MAG_STATE_UP_CENTER - MAG_STATE_UP_OFFSET)
     #define MAG_STATE_UP_MAX                (MAG_STATE_UP_CENTER + MAG_STATE_UP_OFFSET)
     
-    #define MAG_STATE_DOWN_CENTER           (1932)      // 下面状态中心值
+    #define MAG_STATE_DOWN_CENTER           (1813)      // 下面状态中心值
     #define MAG_STATE_DOWN_OFFSET           (100)        // 下面状态偏移量
     #define MAG_STATE_DOWN_MIN              (MAG_STATE_DOWN_CENTER - MAG_STATE_DOWN_OFFSET)
     #define MAG_STATE_DOWN_MAX              (MAG_STATE_DOWN_CENTER + MAG_STATE_DOWN_OFFSET)
@@ -101,6 +101,7 @@ typedef enum {
 } magnetic_slide_switch_event_t;
 
 void magnetic_slide_switch_start(void);
+magnetic_slide_switch_event_t magnetic_slide_switch_get_event(void);
 
 #ifdef __cplusplus
 }

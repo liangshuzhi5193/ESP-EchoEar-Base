@@ -67,7 +67,7 @@ void app_main(void)
     base_angle_limit_switch_init();
 
     xTaskCreate(base_calibration_task, "base_calibration_task", BASE_CALIBRATION_TASK_STACK_SIZE, NULL, 10, NULL);
-    magnetic_slide_switch_start();
+    // magnetic_slide_switch_start();
 
     while (0) {
         stepper_shake_head(12.0, 2, 600);

@@ -19,7 +19,12 @@ extern "C" {
 #define UART_FRAME_HEADER_LEN   (2)
 #define UART_FRAME_MIN_LEN      (5) // Minimum: header + length + command + checksum
 
+// 命令码定义
+#define CMD_BASE_ANGLE_CONTROL              (0x01)  // 底座角度控制
+#define CMD_MAGNETIC_SWITCH_EVENT           (0x03)  // 磁吸滑动开关事件
+
 esp_err_t control_serial_init(void);
+esp_err_t control_serial_send_magnetic_switch_event(uint16_t event);
 
 #ifdef __cplusplus
 }

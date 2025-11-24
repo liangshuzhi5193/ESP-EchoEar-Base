@@ -203,6 +203,7 @@ static void stepper_rotate_ccw_with_accel(int steps, int target_delay_us)
 // target_delay_us: 目标速度延时（微秒），启动时会自动从慢速加速到此速度
 void stepper_rotate_angle_with_accel(float angle, int target_delay_us)
 {
+    printf("stepper_rotate_angle_with_accel: angle=%f, target_delay_us=%d\n", angle, target_delay_us);
     // 半步模式：4128步 = 360度
     int steps = (int)(angle * 4128.0 / 360.0 + 0.5);
     

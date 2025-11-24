@@ -13,6 +13,7 @@
 #include "esp_rom_sys.h"
 
 #include "magnetic_slide_switch.h"
+#include "control_serial.h"
 
 static const char *TAG = "Magnetic Slide Switch";
 
@@ -125,17 +126,19 @@ static void hall_sensor_read_task(void *arg)
                     s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_SLIDE_DOWN;
                     ESP_LOGI(TAG, "Hall switch: SLIDE_DOWN - Voltage dropped by %d mV (from %d to %d)", 
                              -voltage_change, s_last_hall_voltage, voltage[0][0]);
+                    control_serial_send_magnetic_switch_event(s_slider_state);
                 }
                 // 电压变大且变化量大于阈值，判定为滑块向上
                 else if (voltage_change > HALL_SENSOR_VOLTAGE_THRESHOLD && s_slider_state == MAGNETIC_SLIDE_SWITCH_EVENT_SLIDE_DOWN) {
                     s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_SLIDE_UP;
                     ESP_LOGI(TAG, "Hall switch: SLIDE_UP - Voltage increased by %d mV (from %d to %d)", 
                              voltage_change, s_last_hall_voltage, voltage[0][0]);
+                    control_serial_send_magnetic_switch_event(s_slider_state);
                 }
             } else {
                 s_first_hall_reading = false;
                 
-                // 根据第一次读取的电压值判断初始状态
+                // 根据第一次读取的电压值判断初始状态（初始状态不发送事件）
                 if (voltage[0][0] < HALL_SENSOR_INITIAL_STATE_THRESHOLD) {
                     s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_SLIDE_DOWN;
                     ESP_LOGI(TAG, "First reading: Slider initially at DOWN position (voltage=%d < %d mV)", 
@@ -428,9 +431,12 @@ static void magnetometer_read_task(void *arg)
     static bool s_is_in_motion = false;  // 是否正在运动中
     static uint8_t s_stable_count = 0;   // 稳定计数器
     
-    // 单击检测
-    static uint8_t s_transition_count = 0;  // 过渡区停留次数
-    static mag_position_t s_before_transition = MAG_POSITION_UNKNOWN;  // 进入过渡区前的位置
+    // 单击检测 - 基于峰值检测
+    static int16_t s_down_baseline = 0;        // DOWN状态的基准值
+    static bool s_click_drop_detected = false;  // 检测到下降
+    static int16_t s_click_max_drop = 0;       // 记录最大下降量
+    static uint8_t s_click_duration = 0;       // 下降持续时间
+    static uint8_t s_recover_count = 0;        // 恢复计数
 
 #ifdef CONFIG_SENSOR_BMM150
     if (bmm150_interface_init(&s_bmm150) != BMM150_OK) {
@@ -497,26 +503,92 @@ static void magnetometer_read_task(void *arg)
                     detected_position = MAG_POSITION_DOWN;     // 下面
                 }
                 
-                // 4. 稳定性检测和事件触发
+                // 4. 单击检测 - 基于峰值检测（不使用平均值）
+                if (s_current_position == MAG_POSITION_DOWN) {
+                    // 在 DOWN 状态下，监测磁场值的快速下降和恢复
+                    
+                    // 更新基准值（使用平滑更新，避免噪声影响）
+                    if (s_down_baseline == 0) {
+                        s_down_baseline = s_mag_value;  // 首次初始化
+                    } else if (!s_click_drop_detected) {
+                        // 未检测到下降时，缓慢跟踪基准值
+                        s_down_baseline = (s_down_baseline * 9 + s_mag_value) / 10;
+                    }
+                    
+                    // 检测下降（实时值相对基准值）
+                    int16_t drop_value = s_down_baseline - s_mag_value;
+                    
+                    if (!s_click_drop_detected && drop_value >= MAG_CLICK_DROP_THRESHOLD) {
+                        // 首次检测到下降，进入单击检测模式
+                        s_click_drop_detected = true;
+                        s_click_max_drop = drop_value;
+                        s_click_duration = 1;
+                        s_recover_count = 0;
+                        // printf("Click started: baseline=%d, current=%d, drop=%d\n", 
+                        //        s_down_baseline, s_mag_value, drop_value);
+                    } else if (s_click_drop_detected) {
+                        // 已进入单击检测模式
+                        s_click_duration++;
+                        
+                        // 更新最大下降量
+                        if (drop_value > s_click_max_drop) {
+                            s_click_max_drop = drop_value;
+                        }
+                        
+                        // 检测恢复：当前下降值小于最大下降的40%，认为开始恢复
+                        if (drop_value < (s_click_max_drop * 4 / 10)) {
+                            s_recover_count++;
+                            
+                            // 恢复稳定，触发单击事件
+                            if (s_recover_count >= MAG_STABLE_THRESHOLD) {
+                                s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_SINGLE_CLICK;
+                                ESP_LOGI(TAG, "SINGLE_CLICK detected (max_drop=%d, duration=%d)", 
+                                         s_click_max_drop, s_click_duration);
+                                
+                                // 发送事件通知
+                                control_serial_send_magnetic_switch_event(s_slider_state);
+                                
+                                ESP_LOGI(TAG, "--------------------------------\n");
+                                
+                                // 重置单击检测
+                                s_click_drop_detected = false;
+                                s_click_max_drop = 0;
+                                s_click_duration = 0;
+                                s_recover_count = 0;
+                                s_down_baseline = s_mag_value;
+                            }
+                        } else {
+                            // 还未恢复，重置恢复计数
+                            s_recover_count = 0;
+                        }
+                        
+                        // 超时检测：持续时间过长（>200ms），重置
+                        if (s_click_duration > MAG_CLICK_TRANSITION_MAX_COUNT * 2) {
+                            // printf("Click timeout: duration=%d, max_drop=%d\n", 
+                            //        s_click_duration, s_click_max_drop);
+                            s_click_drop_detected = false;
+                            s_click_max_drop = 0;
+                            s_click_duration = 0;
+                            s_recover_count = 0;
+                            s_down_baseline = s_mag_value;
+                        }
+                    }
+                } else {
+                    // 不在 DOWN 状态，重置单击检测
+                    s_click_drop_detected = false;
+                    s_click_max_drop = 0;
+                    s_click_duration = 0;
+                    s_recover_count = 0;
+                    s_down_baseline = 0;
+                }
+                
+                // 5. 稳定性检测和滑动事件触发
                 if (detected_position == MAG_POSITION_UNKNOWN) {
                     // 处于过渡区域（不在任何定义的状态范围内）
                     if (!s_is_in_motion && s_current_position != MAG_POSITION_UNKNOWN) {
                         // 刚离开稳定状态，记录运动起始位置
                         s_motion_start_position = s_current_position;
                         s_is_in_motion = true;
-                        
-                        // 单击检测：记录进入过渡区前的位置
-                        if (s_current_position == MAG_POSITION_DOWN) {
-                            s_before_transition = s_current_position;
-                            s_transition_count = 0;
-                        }
-                        // ESP_LOGI(TAG, "Motion started from position %d (avg=%d)", 
-                        //          s_motion_start_position, average);
-                    }
-                    
-                    // 单击检测：在过渡区累积计数
-                    if (s_before_transition == MAG_POSITION_DOWN) {
-                        s_transition_count++;
                     }
                     
                     // 重置候选状态和稳定计数
@@ -525,46 +597,7 @@ static void magnetometer_read_task(void *arg)
                 }
                 else {
                     // 检测到有效状态（REMOVED/UP/DOWN）
-                    
-                    // 单击检测：从DOWN短暂离开又快速回到DOWN
-                    if (s_before_transition == MAG_POSITION_DOWN && 
-                        detected_position == MAG_POSITION_DOWN) {
-                        
-                        // printf("Click check: count=%d, max=%d, threshold=%d\n", 
-                        //        s_transition_count, MAG_CLICK_TRANSITION_MAX_COUNT, MAG_STABLE_THRESHOLD);
-                        
-                        if (s_transition_count > 0 && 
-                            s_transition_count <= MAG_CLICK_TRANSITION_MAX_COUNT) {
-                            // 回到DOWN状态，检查是否是单击
-                            if (detected_position == s_candidate_position) {
-                                s_stable_count++;
-                            } else {
-                                s_candidate_position = detected_position;
-                                s_stable_count = 1;
-                            }
-                            
-                            // printf("Click candidate: stable_count=%d\n", s_stable_count);
-                            
-                            // 稳定后触发单击
-                            if (s_stable_count >= MAG_STABLE_THRESHOLD) {
-                                s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_SINGLE_CLICK;
-                                ESP_LOGI(TAG, "SINGLE_CLICK (transition_count=%d)", s_transition_count);
-                                
-                                // 重置单击检测
-                                s_before_transition = MAG_POSITION_UNKNOWN;
-                                s_transition_count = 0;
-                                s_is_in_motion = false;
-                                
-                                ESP_LOGI(TAG, "--------------------------------\n");
-                            }
-                        } else {
-                            // 过渡时间太长，不是单击，重置
-                            printf("Click timeout: count=%d > max=%d\n", s_transition_count, MAG_CLICK_TRANSITION_MAX_COUNT);
-                            // s_before_transition = MAG_POSITION_UNKNOWN;
-                            s_transition_count = 0;
-                        }
-                    }
-                    else if (detected_position == s_candidate_position) {
+                    if (detected_position == s_candidate_position) {
                         // 候选状态保持不变，累积稳定计数
                         s_stable_count++;
                         
@@ -572,48 +605,53 @@ static void magnetometer_read_task(void *arg)
                         if (s_stable_count >= MAG_STABLE_THRESHOLD && 
                             detected_position != s_current_position) {
                             // 新状态已稳定，可以触发事件
-                            // ESP_LOGI(TAG, "Position confirmed: %d -> %d (avg=%d)", 
-                            //          s_motion_start_position, detected_position, average);
                             
                             // 只在运动过程中触发事件（避免初始化时误触发）
                             if (s_is_in_motion && s_motion_start_position != MAG_POSITION_UNKNOWN) {
+                                magnetic_slide_switch_event_t event = MAGNETIC_SLIDE_SWITCH_EVENT_INIT;
+                                
                                 // 根据起始位置和目标位置判断事件
                                 if (s_motion_start_position == MAG_POSITION_UP && 
                                     detected_position == MAG_POSITION_DOWN) {
-                                    s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_SLIDE_DOWN;
+                                    event = MAGNETIC_SLIDE_SWITCH_EVENT_SLIDE_DOWN;
                                     ESP_LOGI(TAG, "SLIDE_DOWN");
                                 }
                                 else if (s_motion_start_position == MAG_POSITION_DOWN && 
                                          detected_position == MAG_POSITION_UP) {
-                                    s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_SLIDE_UP;
+                                    event = MAGNETIC_SLIDE_SWITCH_EVENT_SLIDE_UP;
                                     ESP_LOGI(TAG, "SLIDE_UP");
                                 }
                                 else if (s_motion_start_position == MAG_POSITION_UP && 
                                          detected_position == MAG_POSITION_REMOVED) {
-                                    s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_REMOVE_FROM_UP;
+                                    event = MAGNETIC_SLIDE_SWITCH_EVENT_REMOVE_FROM_UP;
                                     ESP_LOGI(TAG, "REMOVE_FROM_UP");
                                 }
                                 else if (s_motion_start_position == MAG_POSITION_DOWN && 
                                          detected_position == MAG_POSITION_REMOVED) {
-                                    s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_REMOVE_FROM_DOWN;
+                                    event = MAGNETIC_SLIDE_SWITCH_EVENT_REMOVE_FROM_DOWN;
                                     ESP_LOGI(TAG, "REMOVE_FROM_DOWN");
                                 }
                                 else if (s_motion_start_position == MAG_POSITION_REMOVED && 
                                          detected_position == MAG_POSITION_UP) {
-                                    s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_PLACE_FROM_UP;
+                                    event = MAGNETIC_SLIDE_SWITCH_EVENT_PLACE_FROM_UP;
                                     ESP_LOGI(TAG, "PLACE_FROM_UP");
                                 }
                                 else if (s_motion_start_position == MAG_POSITION_REMOVED && 
                                          detected_position == MAG_POSITION_DOWN) {
-                                    s_slider_state = MAGNETIC_SLIDE_SWITCH_EVENT_PLACE_FROM_DOWN;
+                                    event = MAGNETIC_SLIDE_SWITCH_EVENT_PLACE_FROM_DOWN;
                                     ESP_LOGI(TAG, "PLACE_FROM_DOWN");
                                 }
                                 
-                                // 重置单击检测
-                                s_before_transition = MAG_POSITION_UNKNOWN;
-                                s_transition_count = 0;
+                                // 更新状态并发送事件
+                                if (event != MAGNETIC_SLIDE_SWITCH_EVENT_INIT) {
+                                    s_slider_state = event;
+                                    control_serial_send_magnetic_switch_event(event);
+                                    printf("send magnetic switch event: %d\n", event);
+                                }
+                                
+                                ESP_LOGI(TAG, "--------------------------------\n");
                             }
-                            ESP_LOGI(TAG, "--------------------------------\n");
+                            
                             // 更新当前位置，清除运动标志
                             s_current_position = detected_position;
                             s_motion_start_position = detected_position;
@@ -624,13 +662,6 @@ static void magnetometer_read_task(void *arg)
                         // 检测到新的候选状态，重新开始稳定性验证
                         s_candidate_position = detected_position;
                         s_stable_count = 1;
-                        
-                        // 如果候选状态不是DOWN，重置单击检测
-                        if (detected_position != MAG_POSITION_DOWN && s_before_transition == MAG_POSITION_DOWN) {
-                            // 过渡到其他稳定状态，不是单击
-                            s_before_transition = MAG_POSITION_UNKNOWN;
-                            s_transition_count = 0;
-                        }
                     }
                 }
             }
@@ -655,8 +686,13 @@ cleanup:
 void magnetic_slide_switch_start(void)
 {
 #ifdef CONFIG_SENSOR_LINEAR_HALL
-    xTaskCreate(hall_sensor_read_task, "hall_sensor_read_task", MAGNETIC_SLIDE_SWITCH_TASK_STACK_SIZE, NULL, 5, NULL);
+    xTaskCreate(hall_sensor_read_task, "hall_sensor_read_task", MAGNETIC_SLIDE_SWITCH_TASK_STACK_SIZE, NULL, 2, NULL);
 #elif defined(CONFIG_SENSOR_MAGNETOMETER)
-    xTaskCreate(magnetometer_read_task, "magnetometer_read_task", MAGNETIC_SLIDE_SWITCH_TASK_STACK_SIZE, NULL, 5, NULL);
+    xTaskCreate(magnetometer_read_task, "magnetometer_read_task", MAGNETIC_SLIDE_SWITCH_TASK_STACK_SIZE, NULL, 2, NULL);
 #endif
+}
+
+magnetic_slide_switch_event_t magnetic_slide_switch_get_event(void)
+{
+    return s_slider_state;
 }
