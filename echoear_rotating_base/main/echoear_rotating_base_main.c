@@ -8,7 +8,7 @@
 #include "control_serial.h"
 #include "stepper_motor.h"
 #include "magnetic_slide_switch.h"
-
+#include "app_csi.h"
 static const char *TAG = "Echoear Rotating Base";
 
 #define BASE_ANGLE_LIMIT_SWITCH_GPIO (GPIO_NUM_1)
@@ -51,11 +51,13 @@ static void base_calibration_task(void *arg)
     while (1) {
         if (!s_base_angle_limit_switch_pressed) {
             stepper_rotate_angle(-5, STEPPER_SPEED_FAST);
+            vTaskDelay(pdMS_TO_TICKS(10));
+            // ESP_LOGI(TAG, "stepper_rotate_angle -5");
         } else {
             stepper_rotate_angle_with_accel(95.0, STEPPER_SPEED_ULTRA_FAST);
             stepper_motor_power_off();
             vTaskDelay(pdMS_TO_TICKS(100));
-            control_serial_init();
+            
             vTaskDelete(NULL);
         }
     }
@@ -63,9 +65,11 @@ static void base_calibration_task(void *arg)
 
 void app_main(void)
 {
+    xTaskCreate(app_csi_task, "app_csi_task", 4096, NULL, 5, NULL);
+
     stepper_motor_gpio_init();
     base_angle_limit_switch_init();
-
+    control_serial_init();
     xTaskCreate(base_calibration_task, "base_calibration_task", BASE_CALIBRATION_TASK_STACK_SIZE, NULL, 10, NULL);
     // magnetic_slide_switch_start();
 

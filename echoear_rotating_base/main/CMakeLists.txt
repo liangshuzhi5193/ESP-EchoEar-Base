@@ -1,2 +1,2 @@
-idf_component_register(SRCS "echoear_rotating_base_main.c"
-                    INCLUDE_DIRS ".")
+idf_component_register(SRC_DIRS "." "./radar_ls"
+                    INCLUDE_DIRS "." "./radar_ls" )

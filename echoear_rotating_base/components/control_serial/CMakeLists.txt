@@ -1,3 +1,3 @@
 idf_component_register(SRCS "control_serial.c"
                     INCLUDE_DIRS "include"
-                    PRIV_REQUIRES driver stepper_motor magnetic_slide_switch)
+                    PRIV_REQUIRES esp_driver_gpio esp_driver_uart stepper_motor)

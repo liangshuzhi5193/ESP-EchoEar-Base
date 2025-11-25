@@ -25,6 +25,7 @@ extern "C" {
 
 esp_err_t control_serial_init(void);
 esp_err_t control_serial_send_magnetic_switch_event(uint16_t event);
+esp_err_t control_serial_send_data(uint8_t *data, uint16_t data_len);
 
 #ifdef __cplusplus
 }

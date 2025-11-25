@@ -6,10 +6,20 @@
 #include "esp_log.h"
 #include "stepper_motor.h"
 #include "control_serial.h"
-#include "magnetic_slide_switch.h"
+
+// #include "magnetic_slide_switch.h"
 
 static const char *TAG = "Control Serial";
-
+extern void app_csi_uart_cb(uint8_t *data, size_t len);
+static uint8_t calc_checksum_f(const uint8_t *payload, uint8_t payload_len)
+{
+    uint8_t sum = 0;
+    for (uint8_t i = 0; i < payload_len; i++) {
+        sum += payload[i];
+        // printf("%d: payload[%d]: %02X, sum: %02X\n", payload_len, i, payload[i], sum);
+    }
+    return sum;
+}
 static void uart_cmd_receive_task(void *arg)
 {
     // Configure a temporary buffer for the incoming data
@@ -24,7 +34,7 @@ static void uart_cmd_receive_task(void *arg)
             // Check frame header
             if (data[0] == 0xAA && data[1] == 0x55) {
                 // Get data length
-                uint8_t data_len = data[3];
+                uint16_t data_len = data[3]|(data[2]<<8);
                 // Get command code
                 uint8_t cmd = data[4];
                 uint8_t calc_checksum = cmd;
@@ -60,7 +70,20 @@ static void uart_cmd_receive_task(void *arg)
                     } else {
                         ESP_LOGW(TAG, "Checksum verification failed");
                     }
-                } else {
+                } else if (cmd >0x05 && len >= 8) { 
+                    uint8_t checksum = calc_checksum_f(data + 4, data_len);
+                    if (checksum == data[len - 1]) {
+                        app_csi_uart_cb(data + 4, data_len);
+                        // 打印 data+4 这段数据
+                        printf("CSI payload (%d bytes): ", data_len);
+                        for (int i = 0; i < data_len; i++) {
+                            printf("%02X ", data[4 + i]);
+                        }
+                        printf("\n");
+                    } else {
+                        ESP_LOGW(TAG, "Checksum verification failed %02X != %02X", checksum, data[len - 1]);
+                    }
+                }else {
                     ESP_LOGW(TAG, "Invalid command or frame length");
                 }
             }
@@ -140,6 +163,33 @@ esp_err_t control_serial_send_magnetic_switch_event(uint16_t event)
         return ESP_OK;
     } else {
         ESP_LOGE(TAG, "Failed to send magnetic switch event: sent=%d", sent);
+        return ESP_FAIL;
+    }
+}
+esp_err_t control_serial_send_data(uint8_t *data, uint16_t data_len)
+{
+    uint8_t tx_buffer[data_len+5];
+    
+    // 帧头
+    tx_buffer[0] = UART_FRAME_HEAD_H;  // 0xAA
+    tx_buffer[1] = UART_FRAME_HEAD_L;  // 0x55
+    
+    // 数据长度 (命令码1字节 + 数据2字节 = 3字节)
+    tx_buffer[2] = data_len>>8;
+    tx_buffer[3] = data_len && 0xFF;
+    
+    memcpy(tx_buffer + 4, data, data_len);
+    uint8_t checksum = calc_checksum_f(data, data_len);
+    tx_buffer[data_len+4] = checksum;
+    
+    // 通过UART发送
+    int sent = uart_write_bytes(ECHO_UART_PORT_NUM, tx_buffer, sizeof(tx_buffer));
+    
+    if (sent == sizeof(tx_buffer)) {
+        ESP_LOGV(TAG, "Data sent: data_len=%d", data_len);
+        return ESP_OK;
+    } else {
+        ESP_LOGE(TAG, "Failed to send data: sent=%d", sent);
         return ESP_FAIL;
     }
 }
