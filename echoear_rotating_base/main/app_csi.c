@@ -33,11 +33,11 @@
 #define CONFIG_LESS_INTERFERENCE_CHANNEL   11
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
     #define CONFIG_WIFI_BAND_MODE   WIFI_BAND_MODE_2G_ONLY
-    #define CONFIG_WIFI_2G_BANDWIDTHS           WIFI_BW_HT20
-    #define CONFIG_WIFI_5G_BANDWIDTHS           WIFI_BW_HT20
+    #define CONFIG_WIFI_2G_BANDWIDTHS           WIFI_BW_HT40
+    #define CONFIG_WIFI_5G_BANDWIDTHS           WIFI_BW_HT40
     #define CONFIG_WIFI_2G_PROTOCOL             WIFI_PROTOCOL_11N
     #define CONFIG_WIFI_5G_PROTOCOL             WIFI_PROTOCOL_11N
-    #define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT20
+    #define CONFIG_ESP_NOW_PHYMODE           WIFI_PHY_MODE_HT40
 #else
     #define CONFIG_WIFI_BANDWIDTH           WIFI_BW_HT20
 #endif
@@ -51,6 +51,7 @@
 
 
 static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t CONFIG_CSI_ECHOEAR_MAC[] = {0x90, 0xe5, 0xb1, 0xa8, 0xcb, 0x4c};
 static const char *TAG = "csi_recv";
 
 
@@ -67,6 +68,7 @@ float   g_csi_move_sensitivity = 0.20f;
 uint16_t g_realtime_time    = 0;    // 实时窗口时间（单位自行约定）
 bool     g_realtime_enable  = false;
 bool     g_csi_enevt_enable = false;
+bool     g_csi_data_enable = false;
 
 typedef struct  {
     bool threshold_calibrate;               /**< Self-calibration acquisition, the most suitable threshold, calibration is to ensure that no one is in the room */
@@ -236,12 +238,12 @@ static void radar_cb(const wifi_radar_info_t *info, void *ctx)
     if (s_buff_count < buff_max_size) {
         return;
     }
-    static uint32_t s_last_call_time = 0;
-    uint32_t now = esp_log_timestamp();
-    if (s_last_call_time != 0) {
-        ESP_LOGI(TAG, "radar_cb interval: %lu ms", now - s_last_call_time);
-    }
-    s_last_call_time = now;
+    // static uint32_t s_last_call_time = 0;
+    // uint32_t now = esp_log_timestamp();
+    // if (s_last_call_time != 0) {
+    //     ESP_LOGI(TAG, "radar_cb interval: %lu ms", now - s_last_call_time);
+    // }
+    // s_last_call_time = now;
 
     extern float median(const float *a, size_t len);
 
@@ -283,15 +285,25 @@ static void radar_cb(const wifi_radar_info_t *info, void *ctx)
     printf("RADAR_DADA,%ld,%s,%d,%d,%d,%d,%.6f,%.6f,%.6f,%d,%.6f,%d,%.6f,%.6f\n",
            s_count++, timestamp_str,0,0,0,0,
            info->waveform_jitter, jitter_midean, jitter_midean / g_console_input_config.predict_move_sensitivity, human_status,g_console_input_config.predict_move_sensitivity, touch_status, g_console_input_config.predict_touch_sensitivity,jitter_midean / g_console_input_config.predict_touch_sensitivity);
-    static uint8_t data_record[3] = {0};
-    data_record[0] = 0x07;
-    data_record[1] = (uint8_t)touch_status | ((uint8_t)human_status<<1);
-    
-    if (data_record[1] != data_record[2]) {
-        control_serial_send_data(data_record, 2);
-        ESP_LOGI(TAG, "data_record[1]: %d", data_record[1]);
+    if (g_csi_data_enable) {
+        uint8_t data_record[3] = {0};
+        data_record[0] = 0x0a;
+        data_record[1] = ((int16_t)(info->waveform_jitter *1000*100))>>8;
+        data_record[2] = ((int16_t)(info->waveform_jitter *1000*100))&0xFF;
+        if (g_csi_data_enable) {
+            control_serial_send_data(data_record, 3);
+        }
     }
-    data_record[2] = data_record[1];
+    static uint8_t event_record[3] = {0};
+    event_record[0] = 0x07;
+    event_record[1] = (uint8_t)touch_status | ((uint8_t)human_status<<1);
+
+
+    if (event_record[1] != event_record[2]) {
+        control_serial_send_data(event_record, 2);
+        ESP_LOGI(TAG, "event_record[1]: %d", event_record[1]);
+    }
+    event_record[2] = event_record[1];
     // if (human_status) {
     //     // s_last_move_time = esp_log_timestamp();
     //     control_serial_send_data(0x07, 0x01);
@@ -313,11 +325,11 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         ESP_LOGW(TAG, "<%s> wifi_csi_cb", esp_err_to_name(ESP_ERR_INVALID_ARG));
         return;
     }
-
+    
     // 过滤不关心的 MAC：
     // - 自发自收模式（0x01）：只保留来自 CONFIG_CSI_SEND_MAC 的数据
     // - 路由器模式（0x02）：只保留来自 AP BSSID (ctx) 的数据
-    if ((g_csi_mode == 0x01 && memcmp(info->mac, CONFIG_CSI_SEND_MAC, 6) != 0) ||
+    if (((g_csi_mode == 0x01 && memcmp(info->mac, CONFIG_CSI_SEND_MAC, 6) != 0) && (g_csi_mode == 0x01 && memcmp(info->mac, CONFIG_CSI_ECHOEAR_MAC, 6) != 0))||
         (g_csi_mode == 0x02 && ctx != NULL && memcmp(info->mac, ctx, 6) != 0)) {
         return;
     }
@@ -479,7 +491,10 @@ void app_csi_uart_cb(uint8_t *data, size_t len)
                     } else {
                         ESP_LOGW(TAG, "SSID/PASS Parse Error: No separator 0x1F found or format error.");
                     }
+                }else if(data[2] == 0x00) {
+
                 }
+
             } else if (type == 0x02) { //查询
                 if(data[2] == 0x01) { // 实时信息
                     g_realtime_time = (uint16_t)data[3]<<8 | data[4];
@@ -493,6 +508,8 @@ void app_csi_uart_cb(uint8_t *data, size_t len)
                     ESP_LOGI(TAG, "CSI Summary Report");
                 }else if(data[2] == 0x03) {//获取事件信息
                     g_csi_enevt_enable = (bool)data[3];
+                }else if(data[2] == 0x04) {//获取CSI数据
+                    g_csi_data_enable = (bool)data[3];
                 }
             }
             break;

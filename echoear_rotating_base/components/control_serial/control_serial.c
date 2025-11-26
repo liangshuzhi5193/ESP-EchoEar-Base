@@ -29,62 +29,80 @@ static void uart_cmd_receive_task(void *arg)
         // Read data from the UART
         int len = uart_read_bytes(ECHO_UART_PORT_NUM, data, (BUF_SIZE - 1), 20 / portTICK_PERIOD_MS);
         if (len > 0) {
-            // Print received data in hexadecimal format
-            // printf("data: %02X %02X %02X %02X %02X %02X %02X %02X\n", data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
-            // Check frame header
-            if (data[0] == 0xAA && data[1] == 0x55) {
-                // Get data length
-                uint16_t data_len = data[3]|(data[2]<<8);
-                // Get command code
-                uint8_t cmd = data[4];
-                uint8_t calc_checksum = cmd;
-
-                // Parse data according to command type
-                if (cmd == CMD_BASE_ANGLE_CONTROL && len >= 8) {  // Base angle control
-                    // Get data value (combine two bytes)
-                    uint16_t value = (data[5] << 8) | data[6];
-                    // Calculate checksum
-                    calc_checksum += data[5] + data[6];
-                    // printf("calc_checksum: 0x%02X\n", calc_checksum);
-                    uint8_t received_checksum = data[7];
-
-                    // Print parsing results
-                    // ESP_LOGI(TAG, "=== Base Angle Control Command ===");
-                    // ESP_LOGI(TAG, "Frame header: 0x%02X 0x%02X", data[0], data[1]);
-                    // ESP_LOGI(TAG, "Data length: %d", data_len);
-                    // ESP_LOGI(TAG, "Command: 0x%02X", cmd);
-                    ESP_LOGI(TAG, "received angle value: %d", value);
-                    // ESP_LOGI(TAG, "Checksum: 0x%02X (calculated: 0x%02X)", received_checksum, calc_checksum);
-
-                    // Checksum verification
-                    if (calc_checksum == received_checksum) {
-                        static int16_t last_diff_angle = 0;
-                        // ESP_LOGI(TAG, "Checksum verification passed");
-                        int16_t diff_angle = value - 90;
-                        printf("diff_angle: %d\n", diff_angle);
-                        stepper_rotate_angle_with_accel(diff_angle - last_diff_angle, STEPPER_SPEED_ULTRA_FAST);
-                        vTaskDelay(pdMS_TO_TICKS(100));
-                        stepper_motor_power_off();
-                        last_diff_angle = diff_angle;
-                        // printf("last_diff_angle: %d\n", last_diff_angle);
-                    } else {
-                        ESP_LOGW(TAG, "Checksum verification failed");
+            int offset = 0;  // 当前处理位置
+            
+            // 循环处理缓冲区中可能存在的多帧数据
+            while (offset < len) {
+                // 检查剩余字节是否足够一个最小帧（至少需要帧头2字节+长度2字节+命令1字节+校验和1字节=6字节）
+                if (offset + 6 > len) {
+                    if (offset < len) {
+                        ESP_LOGW(TAG, "Incomplete frame, remaining bytes: %d", len - offset);
                     }
-                } else if (cmd >0x05 && len >= 8) { 
-                    uint8_t checksum = calc_checksum_f(data + 4, data_len);
-                    if (checksum == data[len - 1]) {
-                        app_csi_uart_cb(data + 4, data_len);
-                        // 打印 data+4 这段数据
+                    break;
+                }
+                
+                // Check frame header
+                if (data[offset] == 0xAA && data[offset + 1] == 0x55) {
+                    // Get data length (包含命令码的长度)
+                    uint16_t data_len = data[offset + 3] | (data[offset + 2] << 8);
+                    
+                    // 计算整个帧的长度：帧头(2) + 长度字段(2) + 数据 + 校验和(1)
+                    uint16_t frame_len = 4 + data_len + 1;
+                    
+                    // 检查剩余数据是否足够一个完整帧
+                    if (offset + frame_len > len) {
+                        ESP_LOGW(TAG, "Incomplete frame, expected %d bytes, remaining %d bytes", frame_len, len - offset);
+                        break;
+                    }
+                    
+                    // Get command code
+                    uint8_t cmd = data[offset + 4];
+                    uint8_t calc_checksum = cmd;
+
+                    // Parse data according to command type
+                    if (cmd == CMD_BASE_ANGLE_CONTROL && data_len >= 3) {  // Base angle control
+                        // Get data value (combine two bytes)
+                        uint16_t value = (data[offset + 5] << 8) | data[offset + 6];
+                        // Calculate checksum
+                        calc_checksum += data[offset + 5] + data[offset + 6];
+                        uint8_t received_checksum = data[offset + 7];
+
+                        ESP_LOGI(TAG, "received angle value: %d", value);
+
+                        // Checksum verification
+                        if (calc_checksum == received_checksum) {
+                            static int16_t last_diff_angle = 0;
+                            int16_t diff_angle = value - 90;
+                            printf("diff_angle: %d\n", diff_angle);
+                            stepper_rotate_angle_with_accel(diff_angle - last_diff_angle, STEPPER_SPEED_ULTRA_FAST);
+                            vTaskDelay(pdMS_TO_TICKS(100));
+                            stepper_motor_power_off();
+                            last_diff_angle = diff_angle;
+                        } else {
+                            ESP_LOGW(TAG, "Checksum verification failed");
+                        }
+                    } else if (cmd > 0x05 && data_len > 1) { 
+                        uint8_t checksum = calc_checksum_f(data + offset + 4, data_len);
                         printf("CSI payload (%d bytes): ", data_len);
                         for (int i = 0; i < data_len; i++) {
-                            printf("%02X ", data[4 + i]);
+                            printf("%02X ", data[offset + 4 + i]);
                         }
-                        printf("\n");
+                        if (checksum == data[offset + data_len + 4]) {
+                            app_csi_uart_cb(data + offset + 4, data_len);
+                            printf("\n");
+                        } else {
+                            ESP_LOGW(TAG, "Checksum verification failed %02X != %02X", checksum, data[offset + data_len + 4]);
+                        }
                     } else {
-                        ESP_LOGW(TAG, "Checksum verification failed %02X != %02X", checksum, data[len - 1]);
+                        ESP_LOGW(TAG, "Invalid command or frame length");
                     }
-                }else {
-                    ESP_LOGW(TAG, "Invalid command or frame length");
+                    
+                    // 移动到下一帧
+                    offset += frame_len;
+                } else {
+                    // 帧头不匹配，跳过一个字节继续查找
+                    ESP_LOGW(TAG, "Invalid frame header at offset %d: 0x%02X 0x%02X", offset, data[offset], data[offset + 1]);
+                    offset++;
                 }
             }
         }
@@ -176,13 +194,19 @@ esp_err_t control_serial_send_data(uint8_t *data, uint16_t data_len)
     
     // 数据长度 (命令码1字节 + 数据2字节 = 3字节)
     tx_buffer[2] = data_len>>8;
-    tx_buffer[3] = data_len && 0xFF;
-    
+    tx_buffer[3] = data_len & 0xFF;
+    // ESP_LOGI(TAG, "data_len: %d, %d, %d", data_len>>8,data_len && 0xFF,data_len);
     memcpy(tx_buffer + 4, data, data_len);
     uint8_t checksum = calc_checksum_f(data, data_len);
     tx_buffer[data_len+4] = checksum;
     
     // 通过UART发送
+    // 打印发送的数据内容
+    ESP_LOGI(TAG, "TX UART DATA (%d bytes): ", data_len + 5);
+    for (int i = 0; i < data_len + 5; i++) {
+        printf("%02X ", tx_buffer[i]);
+    }
+    printf("\n");
     int sent = uart_write_bytes(ECHO_UART_PORT_NUM, tx_buffer, sizeof(tx_buffer));
     
     if (sent == sizeof(tx_buffer)) {
