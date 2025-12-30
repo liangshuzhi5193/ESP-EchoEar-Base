@@ -51,7 +51,7 @@
 
 
 static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
-static const uint8_t CONFIG_CSI_ECHOEAR_MAC[] = {0x90, 0xe5, 0xb1, 0xa8, 0xcb, 0x4c};
+
 static const char *TAG = "csi_recv";
 
 
@@ -63,6 +63,10 @@ char g_wifi_pwd[65]  = {0};   // 最大 64 字节 + 结束符
 uint8_t g_csi_mode             = 0;    // 0: 未配置，0x01: 自发自收，0x02: 路由器模式
 uint8_t g_csi_channel          = CONFIG_LESS_INTERFERENCE_CHANNEL;
 float   g_csi_move_sensitivity = 0.20f;
+
+// 自发自收模式下，下发的目标/对端 MAC（UART 指令中携带）
+uint8_t g_csi_peer_mac[6] = {0};
+bool    g_csi_peer_mac_valid = false;
 
 // 全局 CSI 实时/统计/事件配置（通过串口查询命令配置）
 uint16_t g_realtime_time    = 0;    // 实时窗口时间（单位自行约定）
@@ -173,7 +177,7 @@ static void wifi_init_mode1()
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6  || CONFIG_IDF_TARGET_ESP32C61
     if ((CONFIG_WIFI_BAND_MODE == WIFI_BAND_MODE_2G_ONLY && CONFIG_WIFI_2G_BANDWIDTHS == WIFI_BW_HT20) 
-     || (CONFIG_WIFI_BAND_MODE == WIFI_BAND_MODE_5G_ONLY && CONFIG_WIFI_5G_BANDWIDTHS == WIFI_BW_HT20))
+     || (CONFIG_WIFI_BAND_MODE == WIFI_BAND_MODE_5G_ONLY && CONFIG_WIFI_5G_BANDWIDTHS == WIFI_BW_HT20) || (g_csi_channel ==1))
         ESP_ERROR_CHECK(esp_wifi_set_channel(g_csi_channel, WIFI_SECOND_CHAN_NONE));
     else
         ESP_ERROR_CHECK(esp_wifi_set_channel(g_csi_channel, WIFI_SECOND_CHAN_BELOW));
@@ -191,12 +195,16 @@ static void wifi_esp_now_init(esp_now_peer_info_t peer)
 {
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_set_pmk((uint8_t *)"pmk1234567890123"));
+
     esp_now_rate_config_t rate_config = {
         .phymode = CONFIG_ESP_NOW_PHYMODE, 
         .rate = CONFIG_ESP_NOW_RATE,//  WIFI_PHY_RATE_MCS0_LGI,    
         .ersu = false,                     
         .dcm = false                       
     };
+    if (g_csi_channel ==1) {
+        rate_config.phymode = WIFI_PHY_MODE_HT20;
+    }
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
     ESP_ERROR_CHECK(esp_now_set_peer_rate_config(peer.peer_addr,&rate_config));
 
@@ -329,9 +337,15 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
     // 过滤不关心的 MAC：
     // - 自发自收模式（0x01）：只保留来自 CONFIG_CSI_SEND_MAC 的数据
     // - 路由器模式（0x02）：只保留来自 AP BSSID (ctx) 的数据
-    if (((g_csi_mode == 0x01 && memcmp(info->mac, CONFIG_CSI_SEND_MAC, 6) != 0) && (g_csi_mode == 0x01 && memcmp(info->mac, CONFIG_CSI_ECHOEAR_MAC, 6) != 0))||
-        (g_csi_mode == 0x02 && ctx != NULL && memcmp(info->mac, ctx, 6) != 0)) {
-        return;
+    if (g_csi_mode == 0x01) {
+        const uint8_t *filter_mac = g_csi_peer_mac_valid ? g_csi_peer_mac : CONFIG_CSI_SEND_MAC;
+        if (memcmp(info->mac, filter_mac, 6) != 0) {
+            return;
+        }
+    } else if (g_csi_mode == 0x02) {
+        if (ctx != NULL && memcmp(info->mac, ctx, 6) != 0) {
+            return;
+        }
     }
     wifi_csi_cb(ctx, info);
     wifi_pkt_rx_ctrl_phy_t *phy_info = (wifi_pkt_rx_ctrl_phy_t *)info;
@@ -459,7 +473,19 @@ void app_csi_uart_cb(uint8_t *data, size_t len)
                     g_csi_channel = data[3];
                     g_console_input_config.predict_move_sensitivity = (float)data[4]/100.0;
                     g_console_input_config.predict_touch_sensitivity = (float)data[5]/100.0;
+                    // 接下来 6 个数为 MAC 地址，保存为全局变量（data[6..11]）
+                    if (len >= 12) {
+                        memcpy(g_csi_peer_mac, &data[6], 6);
+                        g_csi_peer_mac_valid = true;
+                        ESP_LOGI(TAG, "g_csi_peer_mac: %02X:%02X:%02X:%02X:%02X:%02X",
+                                 g_csi_peer_mac[0], g_csi_peer_mac[1], g_csi_peer_mac[2],
+                                 g_csi_peer_mac[3], g_csi_peer_mac[4], g_csi_peer_mac[5]);
+                    } else {
+                        g_csi_peer_mac_valid = false;
+                        ESP_LOGW(TAG, "MAC parse failed: len=%u (<12), need data[6..11]", (unsigned)len);
+                    }
                     ESP_LOGI(TAG, "g_csi_channel: %d, predict_move_sensitivity: %f, predict_touch_sensitivity: %f", g_csi_channel, g_console_input_config.predict_move_sensitivity, g_console_input_config.predict_touch_sensitivity);
+                    
                 } else if (g_csi_mode == 0x02) {//路由器模式
                     size_t ssid_len = 0, pwd_len = 0;
                     uint8_t *p = data + 3; // 跳过 [0]=0x06,[1]=type,[2]=g_csi_mode

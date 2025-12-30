@@ -129,7 +129,7 @@ typedef struct {
     .csi_handle_priority  = configMAX_PRIORITIES - 1, \
     .csi_combine_priority = configMAX_PRIORITIES - 1, \
     .csi_recv_interval    = 10, \
-    .csi_handle_time      = 250 \
+    .csi_handle_time      = 100 \
 }
     
 /**

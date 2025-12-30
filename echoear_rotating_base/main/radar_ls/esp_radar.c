@@ -561,6 +561,7 @@ static void csi_data_handle_task(void *arg)
 
     // 主循环：持续从队列接收数据包索引
     while (xQueueReceive(g_csi_data_queue, &buff_index, portMAX_DELAY) && g_wifi_radar_run_flag) {
+        // printf("xQueueReceive(g_csi_data_queue, &buff_index, portMAX_DELAY) && g_wifi_radar_run_flag\n");
         // 初始化雷达信息结构（默认无运动）
         wifi_radar_info_t radar_info = {
             .waveform_jitter = 1,  // 波形抖动初始值

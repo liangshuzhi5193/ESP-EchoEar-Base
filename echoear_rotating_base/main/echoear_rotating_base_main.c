@@ -51,7 +51,7 @@ static void base_calibration_task(void *arg)
     while (1) {
         if (!s_base_angle_limit_switch_pressed) {
             stepper_rotate_angle(-5, STEPPER_SPEED_FAST);
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(1));
             // ESP_LOGI(TAG, "stepper_rotate_angle -5");
         } else {
             stepper_rotate_angle_with_accel(95.0, STEPPER_SPEED_ULTRA_FAST);
